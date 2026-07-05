@@ -197,6 +197,10 @@ export interface AppliedEditsResult {
 	newContent: string;
 }
 
+export interface ApplyEditOptions {
+	replaceAll?: boolean;
+}
+
 /**
  * Find oldText in content, trying exact match first, then fuzzy match.
  * When fuzzy matching is used, the returned contentForReplacement is the
@@ -254,6 +258,39 @@ function countOccurrences(content: string, oldText: string): number {
 	return fuzzyContent.split(fuzzyOldText).length - 1;
 }
 
+function findAllMatches(content: string, oldText: string): FuzzyMatchResult[] {
+	const matches: FuzzyMatchResult[] = [];
+	let index = content.indexOf(oldText);
+	while (index !== -1) {
+		matches.push({
+			found: true,
+			index,
+			matchLength: oldText.length,
+			usedFuzzyMatch: false,
+			contentForReplacement: content,
+		});
+		index = content.indexOf(oldText, index + oldText.length);
+	}
+	if (matches.length > 0) {
+		return matches;
+	}
+
+	const fuzzyContent = normalizeForFuzzyMatch(content);
+	const fuzzyOldText = normalizeForFuzzyMatch(oldText);
+	index = fuzzyContent.indexOf(fuzzyOldText);
+	while (index !== -1) {
+		matches.push({
+			found: true,
+			index,
+			matchLength: fuzzyOldText.length,
+			usedFuzzyMatch: true,
+			contentForReplacement: fuzzyContent,
+		});
+		index = fuzzyContent.indexOf(fuzzyOldText, index + fuzzyOldText.length);
+	}
+	return matches;
+}
+
 function getNotFoundError(path: string, editIndex: number, totalEdits: number): Error {
 	if (totalEdits === 1) {
 		return new Error(
@@ -301,6 +338,50 @@ function getNoChangeError(path: string, totalEdits: number): Error {
  * overlays those line-level changes onto the original content so unchanged line
  * blocks keep their original bytes.
  */
+export function applyEditToNormalizedContent(
+	normalizedContent: string,
+	edit: Edit,
+	path: string,
+	options: ApplyEditOptions = {},
+): AppliedEditsResult {
+	if (!options.replaceAll) {
+		return applyEditsToNormalizedContent(normalizedContent, [edit], path);
+	}
+
+	const normalizedEdit = {
+		oldText: normalizeToLF(edit.oldText),
+		newText: normalizeToLF(edit.newText),
+	};
+	if (normalizedEdit.oldText.length === 0) {
+		throw getEmptyOldTextError(path, 0, 1);
+	}
+
+	const matches = findAllMatches(normalizedContent, normalizedEdit.oldText);
+	if (matches.length === 0) {
+		throw getNotFoundError(path, 0, 1);
+	}
+
+	const usedFuzzyMatch = matches.some((match) => match.usedFuzzyMatch);
+	const replacementBaseContent = usedFuzzyMatch ? normalizeForFuzzyMatch(normalizedContent) : normalizedContent;
+	const matchedEdits = matches.map((match, index) => ({
+		editIndex: index,
+		matchIndex: match.index,
+		matchLength: match.matchLength,
+		newText: normalizedEdit.newText,
+	}));
+
+	const baseContent = normalizedContent;
+	const newContent = usedFuzzyMatch
+		? applyReplacementsPreservingUnchangedLines(normalizedContent, replacementBaseContent, matchedEdits)
+		: applyReplacements(replacementBaseContent, matchedEdits);
+
+	if (baseContent === newContent) {
+		throw getNoChangeError(path, 1);
+	}
+
+	return { baseContent, newContent };
+}
+
 export function applyEditsToNormalizedContent(
 	normalizedContent: string,
 	edits: Edit[],
@@ -555,6 +636,34 @@ export async function computeEditDiff(
 	oldText: string,
 	newText: string,
 	cwd: string,
+	options: ApplyEditOptions = {},
 ): Promise<EditDiffResult | EditDiffError> {
-	return computeEditsDiff(path, [{ oldText, newText }], cwd);
+	if (!options.replaceAll) {
+		return computeEditsDiff(path, [{ oldText, newText }], cwd);
+	}
+
+	const absolutePath = resolveToCwd(path, cwd);
+
+	try {
+		try {
+			await access(absolutePath, constants.R_OK);
+		} catch (error: unknown) {
+			const errorMessage = error instanceof Error && "code" in error ? `Error code: ${error.code}` : String(error);
+			return { error: `Could not edit file: ${path}. ${errorMessage}.` };
+		}
+
+		const rawContent = await readFile(absolutePath, "utf-8");
+		const { text: content } = stripBom(rawContent);
+		const normalizedContent = normalizeToLF(content);
+		const { baseContent, newContent } = applyEditToNormalizedContent(
+			normalizedContent,
+			{ oldText, newText },
+			path,
+			options,
+		);
+
+		return generateDiffString(baseContent, newContent);
+	} catch (err) {
+		return { error: err instanceof Error ? err.message : String(err) };
+	}
 }
