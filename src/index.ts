@@ -9,6 +9,7 @@ interface ShakeResult {
 	imagesDropped?: number;
 	tokensFreed: number;
 	artifactId?: string;
+	runtimeRefresh?: RuntimeRefreshStatus;
 }
 
 type TextBlock = { type: "text"; text: string };
@@ -31,6 +32,12 @@ type MutableSessionManager = {
 	rewriteEntries?: () => Promise<void>;
 	saveArtifact?: (content: string, toolType: string) => Promise<string | undefined>;
 };
+type RuntimeRefreshStatus = "unavailable" | "refreshed";
+type ExtensionCommandContextLike = {
+	shake?: (mode: ShakeMode) => Promise<ShakeResult>;
+	refreshSessionContext?: (options?: { resetProviderSessions?: "historyRewrite" }) => Promise<void>;
+};
+type CommitRewrite = () => Promise<RuntimeRefreshStatus>;
 
 interface ShakeConfig {
 	protectTokens: number;
@@ -357,7 +364,20 @@ function shakePlaceholder(region: ShakeRegion, index: number, artifactId: string
 	return `[shaken ~${region.tokens} tokens]`;
 }
 
-async function dropImages(sessionManager: MutableSessionManager): Promise<{ removed: number }> {
+async function commitBestEffortRewrite(ctx: ExtensionCommandContextLike, sessionManager: MutableSessionManager): Promise<RuntimeRefreshStatus> {
+	await sessionManager.rewriteEntries?.();
+	if (typeof ctx.refreshSessionContext === "function") {
+		await ctx.refreshSessionContext({ resetProviderSessions: "historyRewrite" });
+		return "refreshed";
+	}
+	return "unavailable";
+}
+
+function didRewriteSession(result: ShakeResult): boolean {
+	return result.toolResultsDropped > 0 || result.blocksDropped > 0 || (result.imagesDropped ?? 0) > 0;
+}
+
+async function dropImages(sessionManager: MutableSessionManager, commitRewrite: CommitRewrite): Promise<{ removed: number; runtimeRefresh?: RuntimeRefreshStatus }> {
 	const branchEntries = sessionManager.getBranch();
 	let removed = 0;
 	for (const entry of branchEntries) {
@@ -371,14 +391,14 @@ async function dropImages(sessionManager: MutableSessionManager): Promise<{ remo
 			removed += result.removed;
 		}
 	}
-	if (removed > 0) await sessionManager.rewriteEntries?.();
-	return { removed };
+	if (removed === 0) return { removed };
+	return { removed, runtimeRefresh: await commitRewrite() };
 }
 
-async function shake(sessionManager: MutableSessionManager, mode: ShakeMode): Promise<ShakeResult> {
+async function shake(sessionManager: MutableSessionManager, mode: ShakeMode, commitRewrite: CommitRewrite): Promise<ShakeResult> {
 	if (mode === "images") {
-		const { removed } = await dropImages(sessionManager);
-		return { mode, toolResultsDropped: 0, blocksDropped: 0, imagesDropped: removed, tokensFreed: 0 };
+		const { removed, runtimeRefresh } = await dropImages(sessionManager, commitRewrite);
+		return { mode, toolResultsDropped: 0, blocksDropped: 0, imagesDropped: removed, tokensFreed: 0, runtimeRefresh };
 	}
 
 	const branchEntries = sessionManager.getBranch();
@@ -400,8 +420,8 @@ async function shake(sessionManager: MutableSessionManager, mode: ShakeMode): Pr
 	});
 
 	applyShakeRegions(items);
-	await sessionManager.rewriteEntries?.();
-	return { mode, toolResultsDropped, blocksDropped, tokensFreed: Math.max(0, originalTokens - replacementTokens), artifactId };
+	const runtimeRefresh = await commitRewrite();
+	return { mode, toolResultsDropped, blocksDropped, tokensFreed: Math.max(0, originalTokens - replacementTokens), artifactId, runtimeRefresh };
 }
 
 export default function piShakeExtension(pi: ExtensionAPI): void {
@@ -415,14 +435,24 @@ export default function piShakeExtension(pi: ExtensionAPI): void {
 			}
 
 			await ctx.waitForIdle();
+			const ctxWithFutureApis = ctx as ExtensionCommandContextLike;
+			if (typeof ctxWithFutureApis.shake === "function") {
+				const result = await ctxWithFutureApis.shake(mode);
+				ctx.ui.notify(formatShakeSummary(result), "info");
+				return;
+			}
+
 			const sessionManager = ctx.sessionManager as unknown as MutableSessionManager;
 			if (typeof sessionManager.rewriteEntries !== "function") {
 				ctx.ui.notify("/shake is unavailable: this Pi version does not expose session rewriting to extensions.", "error");
 				return;
 			}
 
-			const result = await shake(sessionManager, mode);
+			const result = await shake(sessionManager, mode, () => commitBestEffortRewrite(ctxWithFutureApis, sessionManager));
 			ctx.ui.notify(formatShakeSummary(result), "info");
+			if (didRewriteSession(result) && result.runtimeRefresh === "unavailable") {
+				ctx.ui.notify("Persisted session was shaken; live provider cache may update only after a session reload.", "warning");
+			}
 		},
 	});
 }
