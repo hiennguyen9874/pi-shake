@@ -1,5 +1,7 @@
 # pi-shake
 
+> Copied from [github.com/can1357/oh-my-pi](https://github.com/can1357/oh-my-pi)
+
 `pi-shake` is a Pi coding-agent extension that lets you manually "shake" heavy content out of future model context without rewriting the saved session history.
 
 It registers a `/shake` command for Pi. When you run it, the extension records lightweight pruning rules in the session. On later context-building events, those rules are applied to the messages sent to the model, replacing or removing selected heavy content.
