@@ -1,21 +1,52 @@
 import { describe, expect, test } from "vitest";
 import piShakeExtension from "../src/index";
 
-function registerExtensionCommand() {
-	let handler: ((args: string, ctx: any) => Promise<void>) | undefined;
+type CommandHandler = (args: string, ctx: any) => Promise<void>;
+type EventHandler = (event: any, ctx: any) => Promise<any> | any;
+
+function registerExtension() {
+	let command: CommandHandler | undefined;
+	const handlers = new Map<string, EventHandler[]>();
+	const appended: Array<{ customType: string; data: any }> = [];
+
 	piShakeExtension({
-		registerCommand(name: string, definition: { handler: typeof handler }) {
+		registerCommand(name: string, definition: { handler: CommandHandler }) {
 			expect(name).toBe("shake");
-			handler = definition.handler;
+			command = definition.handler;
+		},
+		on(event: string, handler: EventHandler) {
+			handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+		},
+		appendEntry(customType: string, data: any) {
+			appended.push({ customType, data });
 		},
 	} as any);
-	expect(handler).toBeDefined();
-	return handler!;
+
+	expect(command).toBeDefined();
+	return {
+		command: command!,
+		appended,
+		async emit(event: string, payload: any, ctx: any = {}) {
+			let result: any;
+			for (const handler of handlers.get(event) ?? []) {
+				result = await handler(payload, ctx);
+			}
+			return result;
+		},
+	};
+}
+
+function makeNotifications() {
+	const messages: string[] = [];
+	return {
+		messages,
+		ui: { notify: (message: string) => messages.push(message) },
+	};
 }
 
 describe("pi-shake extension", () => {
-	test("/shake elide replaces tool results, stores original text, and warns when runtime refresh is unavailable", async () => {
-		const command = registerExtensionCommand();
+	test("/shake elide replaces selected tool results in future context", async () => {
+		const extension = registerExtension();
 		const entries = [
 			{
 				type: "message",
@@ -31,130 +62,114 @@ describe("pi-shake extension", () => {
 					toolCallId: "call-1",
 					toolName: "bash",
 					content: [{ type: "text", text: "heavy output" }],
+					isError: false,
 				},
 			},
 		];
-		let rewritten = false;
-		let artifactContent = "";
-		const notifications: string[] = [];
+		const notifications = makeNotifications();
 
-		await command("", {
+		await extension.command("", {
 			waitForIdle: async () => undefined,
-			sessionManager: {
-				getBranch: () => entries,
-				rewriteEntries: async () => {
-					rewritten = true;
-				},
-				saveArtifact: async (content: string, toolType: string) => {
-					expect(toolType).toBe("shake");
-					artifactContent = content;
-					return "abc123";
-				},
-			},
-			ui: { notify: (message: string) => notifications.push(message) },
+			sessionManager: { getBranch: () => entries },
+			ui: notifications.ui,
 		});
 
-		expect(rewritten).toBe(true);
-		expect(artifactContent).toContain("heavy output");
-		expect(entries[1].message.content[0]).toMatchObject({ type: "text" });
-		expect((entries[1].message.content[0] as { text: string }).text).toMatch(/^\[shaken ~\d+ tokens - recover: artifact:\/\/abc123 \(region 1\)\]$/);
-		expect((entries[1].message as { prunedAt?: number }).prunedAt).toEqual(expect.any(Number));
-		expect(notifications[0]).toMatch(/^Shook 1 tool result \(~\d+ tokens freed\)\.$/);
-		expect(notifications[1]).toBe("Persisted session was shaken; live provider cache may update only after a session reload.");
+		expect(extension.appended).toHaveLength(1);
+		expect(extension.appended[0].customType).toBe("pi-shake-state");
+		expect(notifications.messages[0]).toMatch(/^Shook 1 tool result \(~\d+ tokens freed\)\.$/);
+
+		const messages = [
+			{
+				role: "toolResult",
+				toolCallId: "call-1",
+				toolName: "bash",
+				content: [{ type: "text", text: "heavy output" }],
+				isError: false,
+			},
+		];
+		const result = await extension.emit("context", { messages });
+
+		expect(result.messages[0].content[0]).toMatchObject({ type: "text" });
+		expect(result.messages[0].content[0].text).toMatch(/^\[shaken ~\d+ tokens\]$/);
+		// Saved session history is not destructively rewritten.
+		expect((entries[1].message.content[0] as { text: string }).text).toBe("heavy output");
 	});
 
-	test("/shake images removes image content and keeps text", async () => {
-		const command = registerExtensionCommand();
+	test("/shake images removes only images already present when the command ran", async () => {
+		const extension = registerExtension();
+		const oldImage = { type: "image", data: "old", mimeType: "image/png" };
+		const newImage = { type: "image", data: "new", mimeType: "image/png" };
 		const entries = [
 			{
 				type: "message",
 				message: {
 					role: "user",
-					content: [
-						{ type: "text", text: "keep" },
-						{ type: "image", data: "drop" },
-					],
+					content: [{ type: "text", text: "keep" }, oldImage],
 				},
 			},
 		];
-		let rewritten = false;
-		const notifications: string[] = [];
+		const notifications = makeNotifications();
 
-		await command("images", {
+		await extension.command("images", {
 			waitForIdle: async () => undefined,
+			sessionManager: { getBranch: () => entries },
+			ui: notifications.ui,
+		});
+
+		expect(notifications.messages).toEqual(["Dropped 1 image from this session."]);
+		expect(extension.appended[0].data.imageSignatures).toHaveLength(1);
+
+		const result = await extension.emit("context", {
+			messages: [
+				{
+					role: "user",
+					content: [{ type: "text", text: "keep" }, oldImage, newImage],
+				},
+			],
+		});
+
+		expect(result.messages[0].content).toEqual([{ type: "text", text: "keep" }, newImage]);
+		expect(entries[0].message.content).toEqual([{ type: "text", text: "keep" }, oldImage]);
+	});
+
+	test("session_start restores previously recorded shake state", async () => {
+		const extension = registerExtension();
+
+		await extension.emit("session_start", {}, {
 			sessionManager: {
-				getBranch: () => entries,
-				rewriteEntries: async () => {
-					rewritten = true;
-				},
+				getBranch: () => [
+					{
+						type: "custom",
+						customType: "pi-shake-state",
+						data: {
+							version: 1,
+							rules: [
+								{
+									kind: "toolResult",
+									toolCallId: "call-1",
+									replacement: "[shaken ~3 tokens]",
+									originalText: "heavy output",
+									tokens: 3,
+								},
+							],
+						},
+					},
+				],
 			},
-			ui: { notify: (message: string) => notifications.push(message) },
 		});
 
-		expect(rewritten).toBe(true);
-		expect(entries[0].message.content).toEqual([{ type: "text", text: "keep" }]);
-		expect(notifications).toEqual([
-			"Dropped 1 image from this session.",
-			"Persisted session was shaken; live provider cache may update only after a session reload.",
-		]);
-	});
-
-	test("/shake delegates to a future host shake API before requiring hidden rewriteEntries", async () => {
-		const command = registerExtensionCommand();
-		let delegatedMode = "";
-		const notifications: string[] = [];
-
-		await command("elide", {
-			waitForIdle: async () => undefined,
-			shake: async (mode: string) => {
-				delegatedMode = mode;
-				return { mode, toolResultsDropped: 0, blocksDropped: 0, tokensFreed: 0 };
-			},
-			sessionManager: {},
-			ui: { notify: (message: string) => notifications.push(message) },
-		});
-
-		expect(delegatedMode).toBe("elide");
-		expect(notifications).toEqual(["Nothing to shake."]);
-	});
-
-	test("/shake uses a future refresh API after persisted rewrite when available", async () => {
-		const command = registerExtensionCommand();
-		const entries = [
-			{
-				type: "message",
-				message: {
-					role: "assistant",
-					content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: {} }],
-				},
-			},
-			{
-				type: "message",
-				message: {
+		const result = await extension.emit("context", {
+			messages: [
+				{
 					role: "toolResult",
 					toolCallId: "call-1",
 					toolName: "bash",
 					content: [{ type: "text", text: "heavy output" }],
+					isError: false,
 				},
-			},
-		];
-		let refreshedWith: unknown;
-		const notifications: string[] = [];
-
-		await command("", {
-			waitForIdle: async () => undefined,
-			refreshSessionContext: async (options: unknown) => {
-				refreshedWith = options;
-			},
-			sessionManager: {
-				getBranch: () => entries,
-				rewriteEntries: async () => undefined,
-			},
-			ui: { notify: (message: string) => notifications.push(message) },
+			],
 		});
 
-		expect(refreshedWith).toEqual({ resetProviderSessions: "historyRewrite" });
-		expect(notifications).toHaveLength(1);
-		expect(notifications[0]).toMatch(/^Shook 1 tool result \(~\d+ tokens freed\)\.$/);
+		expect(result.messages[0].content).toEqual([{ type: "text", text: "[shaken ~3 tokens]" }]);
 	});
 });

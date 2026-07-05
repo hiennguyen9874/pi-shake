@@ -8,13 +8,11 @@ interface ShakeResult {
 	blocksDropped: number;
 	imagesDropped?: number;
 	tokensFreed: number;
-	artifactId?: string;
-	runtimeRefresh?: RuntimeRefreshStatus;
 }
 
 type TextBlock = { type: "text"; text: string };
 type ContentBlock = { type: string; text?: string; [key: string]: unknown };
-type Message = { role?: string; content?: string | ContentBlock[]; [key: string]: unknown };
+type Message = { role?: string; content?: string | ContentBlock[]; toolCallId?: string; toolName?: string; prunedAt?: number; useless?: boolean; isError?: boolean; details?: { images?: unknown[] } | null };
 type SessionEntry = { type: string; id?: string; message?: Message; content?: string | ContentBlock[]; customType?: string; [key: string]: unknown };
 type ToolCallBlock = { type: "toolCall"; id: string; name?: string; arguments?: Record<string, unknown> };
 type ToolResultMessage = Message & {
@@ -27,17 +25,21 @@ type ToolResultMessage = Message & {
 	isError?: boolean;
 	details?: { images?: unknown[] } | null;
 };
-type MutableSessionManager = {
+type SessionReader = {
 	getBranch(): SessionEntry[];
-	rewriteEntries?: () => Promise<void>;
-	saveArtifact?: (content: string, toolType: string) => Promise<string | undefined>;
 };
-type RuntimeRefreshStatus = "unavailable" | "refreshed";
-type ExtensionCommandContextLike = {
-	shake?: (mode: ShakeMode) => Promise<ShakeResult>;
-	refreshSessionContext?: (options?: { resetProviderSessions?: "historyRewrite" }) => Promise<void>;
+type ContextShakeRule =
+	| { kind: "toolResult"; toolCallId: string; replacement: string; originalText: string; tokens: number }
+	| { kind: "block"; replacement: string; originalText: string; tokens: number; label: string };
+type PersistedShakeState = {
+	version: 1;
+	rules?: ContextShakeRule[];
+	imageSignatures?: string[];
 };
-type CommitRewrite = () => Promise<RuntimeRefreshStatus>;
+type ShakeState = {
+	rules: ContextShakeRule[];
+	imageSignatures: Set<string>;
+};
 
 interface ShakeConfig {
 	protectTokens: number;
@@ -268,75 +270,6 @@ function collectShakeRegions(entries: SessionEntry[], config: ShakeConfig): Shak
 	return savings < config.minSavings ? [] : regions;
 }
 
-function applyShakeRegion(region: ShakeRegion, replacement: string): void {
-	if (region.kind === "toolResult") {
-		const message = region.entry.message as ToolResultMessage;
-		message.content = [{ type: "text", text: replacement }];
-		message.prunedAt = Date.now();
-		return;
-	}
-
-	const target = region.entry.type === "message" ? region.entry.message : region.entry;
-	if (!target) return;
-	if (region.blockIndex === -1) {
-		if (typeof target.content !== "string") return;
-		target.content = target.content.slice(0, region.start) + replacement + target.content.slice(region.end);
-		return;
-	}
-	if (!Array.isArray(target.content)) return;
-	const block = target.content[region.blockIndex];
-	if (block?.type !== "text" || typeof block.text !== "string") return;
-	block.text = block.text.slice(0, region.start) + replacement + block.text.slice(region.end);
-}
-
-function applyShakeRegions(items: Array<{ region: ShakeRegion; replacement: string }>): void {
-	const ordered = [...items].sort((a, b) => {
-		const aStart = a.region.kind === "block" ? a.region.start : -1;
-		const bStart = b.region.kind === "block" ? b.region.start : -1;
-		return bStart - aStart;
-	});
-	for (const item of ordered) applyShakeRegion(item.region, item.replacement);
-}
-
-function stripImagesFromArrayContent(content: ContentBlock[]): { content: ContentBlock[]; removed: number } {
-	const kept: ContentBlock[] = [];
-	let removed = 0;
-	for (const block of content) {
-		if (block.type === "image") removed++;
-		else kept.push(block);
-	}
-	if (removed > 0 && kept.length === 0) kept.push({ type: "text", text: "[image removed]" });
-	return { content: removed === 0 ? content : kept, removed };
-}
-
-function stripImagesFromMessage(message: Message): number {
-	if (Array.isArray(message.content)) {
-		const result = stripImagesFromArrayContent(message.content);
-		if (result.removed > 0) message.content = result.content;
-		let removed = result.removed;
-		if (message.role === "toolResult") {
-			const details = (message as ToolResultMessage).details;
-			if (details && Array.isArray(details.images)) {
-				const original = details.images;
-				details.images = original.filter(candidate => !(candidate && typeof candidate === "object" && (candidate as { type?: unknown }).type === "image"));
-				removed += original.length - details.images.length;
-			}
-		}
-		return removed;
-	}
-	if (message.role === "fileMention" && Array.isArray(message.files)) {
-		let removed = 0;
-		for (const file of message.files as Array<{ image?: unknown }>) {
-			if (file.image) {
-				file.image = undefined;
-				removed++;
-			}
-		}
-		return removed;
-	}
-	return 0;
-}
-
 function findLatestCompactionBoundary(entries: SessionEntry[]): string | undefined {
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
@@ -345,88 +278,219 @@ function findLatestCompactionBoundary(entries: SessionEntry[]): string | undefin
 	return undefined;
 }
 
-async function saveShakeArtifact(sessionManager: MutableSessionManager, regions: ShakeRegion[]): Promise<string | undefined> {
-	if (!sessionManager.saveArtifact) return undefined;
-	const parts: string[] = [];
-	for (let i = 0; i < regions.length; i++) {
-		const region = regions[i];
-		parts.push(`### region ${i + 1} (${region.label}, ~${region.tokens} tok)`, "", region.originalText, "");
+const SHAKE_STATE_CUSTOM_TYPE = "pi-shake-state";
+
+function createShakeState(): ShakeState {
+	return { rules: [], imageSignatures: new Set() };
+}
+
+function isContextShakeRule(value: unknown): value is ContextShakeRule {
+	if (!value || typeof value !== "object") return false;
+	const rule = value as Partial<ContextShakeRule> & { kind?: unknown; replacement?: unknown; originalText?: unknown; tokens?: unknown };
+	if (rule.kind !== "toolResult" && rule.kind !== "block") return false;
+	if (typeof rule.replacement !== "string" || typeof rule.originalText !== "string" || typeof rule.tokens !== "number") return false;
+	if (rule.kind === "toolResult") return typeof (rule as { toolCallId?: unknown }).toolCallId === "string";
+	return typeof (rule as { label?: unknown }).label === "string";
+}
+
+function mergePersistedShakeState(state: ShakeState, data: unknown): void {
+	if (!data || typeof data !== "object") return;
+	const persisted = data as Partial<PersistedShakeState>;
+	if (persisted.version !== 1) return;
+	if (Array.isArray(persisted.rules)) {
+		for (const rule of persisted.rules) {
+			if (isContextShakeRule(rule) && !hasRule(state, rule)) state.rules.push(rule);
+		}
 	}
-	try {
-		return await sessionManager.saveArtifact(parts.join("\n"), "shake");
-	} catch {
-		return undefined;
+	if (Array.isArray(persisted.imageSignatures)) {
+		for (const signature of persisted.imageSignatures) {
+			if (typeof signature === "string") state.imageSignatures.add(signature);
+		}
 	}
 }
 
-function shakePlaceholder(region: ShakeRegion, index: number, artifactId: string | undefined): string {
-	if (artifactId) return `[shaken ~${region.tokens} tokens - recover: artifact://${artifactId} (region ${index + 1})]`;
+function reconstructShakeState(sessionManager: SessionReader, state: ShakeState): void {
+	state.rules = [];
+	state.imageSignatures.clear();
+	for (const entry of sessionManager.getBranch()) {
+		if (entry.type === "custom" && entry.customType === SHAKE_STATE_CUSTOM_TYPE) mergePersistedShakeState(state, entry.data);
+	}
+}
+
+function replacementForRegion(region: ShakeRegion): string {
 	return `[shaken ~${region.tokens} tokens]`;
 }
 
-async function commitBestEffortRewrite(ctx: ExtensionCommandContextLike, sessionManager: MutableSessionManager): Promise<RuntimeRefreshStatus> {
-	await sessionManager.rewriteEntries?.();
-	if (typeof ctx.refreshSessionContext === "function") {
-		await ctx.refreshSessionContext({ resetProviderSessions: "historyRewrite" });
-		return "refreshed";
+function ruleFromRegion(region: ShakeRegion): ContextShakeRule | undefined {
+	const replacement = replacementForRegion(region);
+	if (region.kind === "toolResult") {
+		const toolResult = getToolResultMessage(region.entry);
+		if (!toolResult) return undefined;
+		return { kind: "toolResult", toolCallId: toolResult.toolCallId, replacement, originalText: region.originalText, tokens: region.tokens };
 	}
-	return "unavailable";
+	return { kind: "block", replacement, originalText: region.originalText, tokens: region.tokens, label: region.label };
 }
 
-function didRewriteSession(result: ShakeResult): boolean {
-	return result.toolResultsDropped > 0 || result.blocksDropped > 0 || (result.imagesDropped ?? 0) > 0;
+function hasRule(state: ShakeState, rule: ContextShakeRule): boolean {
+	return state.rules.some(existing => {
+		if (existing.kind !== rule.kind) return false;
+		if (existing.kind === "toolResult" && rule.kind === "toolResult") return existing.toolCallId === rule.toolCallId;
+		return existing.originalText === rule.originalText;
+	});
 }
 
-async function dropImages(sessionManager: MutableSessionManager, commitRewrite: CommitRewrite): Promise<{ removed: number; runtimeRefresh?: RuntimeRefreshStatus }> {
-	const branchEntries = sessionManager.getBranch();
+function imageSignature(block: ContentBlock): string | undefined {
+	if (block.type !== "image") return undefined;
+	return JSON.stringify(block);
+}
+
+function collectImageSignaturesFromContent(content: string | ContentBlock[] | undefined, out: string[]): void {
+	if (!Array.isArray(content)) return;
+	for (const block of content) {
+		const signature = imageSignature(block);
+		if (signature) out.push(signature);
+	}
+}
+
+function collectImageSignatures(entries: SessionEntry[]): string[] {
+	const signatures: string[] = [];
+	for (const entry of entries) {
+		if (entry.type === "message") collectImageSignaturesFromContent(entry.message?.content, signatures);
+		else if (entry.type === "custom_message") collectImageSignaturesFromContent(entry.content, signatures);
+	}
+	return signatures;
+}
+
+function replaceAllText(value: string, oldText: string, newText: string): { value: string; changed: boolean } {
+	if (!value.includes(oldText)) return { value, changed: false };
+	return { value: value.split(oldText).join(newText), changed: true };
+}
+
+function applyBlockRulesToContent(content: string | ContentBlock[] | undefined, rules: ContextShakeRule[]): { content: string | ContentBlock[] | undefined; changed: boolean } {
+	const blockRules = rules.filter((rule): rule is Extract<ContextShakeRule, { kind: "block" }> => rule.kind === "block");
+	if (blockRules.length === 0) return { content, changed: false };
+	let changed = false;
+	if (typeof content === "string") {
+		let next = content;
+		for (const rule of blockRules) {
+			const result = replaceAllText(next, rule.originalText, rule.replacement);
+			next = result.value;
+			changed = changed || result.changed;
+		}
+		return { content: next, changed };
+	}
+	if (!Array.isArray(content)) return { content, changed: false };
+	const next = content.map(block => {
+		if (block.type !== "text" || typeof block.text !== "string") return block;
+		let text = block.text;
+		let blockChanged = false;
+		for (const rule of blockRules) {
+			const result = replaceAllText(text, rule.originalText, rule.replacement);
+			text = result.value;
+			blockChanged = blockChanged || result.changed;
+		}
+		if (!blockChanged) return block;
+		changed = true;
+		return { ...block, text };
+	});
+	return { content: changed ? next : content, changed };
+}
+
+function stripRecordedImages(content: string | ContentBlock[] | undefined, imageSignatures: Set<string>): { content: string | ContentBlock[] | undefined; changed: boolean } {
+	if (!Array.isArray(content) || imageSignatures.size === 0) return { content, changed: false };
 	let removed = 0;
-	for (const entry of branchEntries) {
-		if (entry.type === "message" && entry.message) {
-			removed += stripImagesFromMessage(entry.message);
-			continue;
-		}
-		if (entry.type === "custom_message" && Array.isArray(entry.content)) {
-			const result = stripImagesFromArrayContent(entry.content);
-			if (result.removed > 0) entry.content = result.content;
-			removed += result.removed;
-		}
-	}
-	if (removed === 0) return { removed };
-	return { removed, runtimeRefresh: await commitRewrite() };
+	const kept = content.filter(block => {
+		const signature = imageSignature(block);
+		if (!signature || !imageSignatures.has(signature)) return true;
+		removed++;
+		return false;
+	});
+	if (removed === 0) return { content, changed: false };
+	return { content: kept.length === 0 ? [{ type: "text", text: "[image removed]" }] : kept, changed: true };
 }
 
-async function shake(sessionManager: MutableSessionManager, mode: ShakeMode, commitRewrite: CommitRewrite): Promise<ShakeResult> {
+function applyContextShake(messages: Message[], state: ShakeState): { messages: Message[]; changed: boolean } {
+	if (state.rules.length === 0 && state.imageSignatures.size === 0) return { messages, changed: false };
+	let changed = false;
+	const nextMessages = messages.map(message => {
+		let next = message;
+		if (message.role === "toolResult" && typeof message.toolCallId === "string") {
+			const rule = state.rules.find(candidate => candidate.kind === "toolResult" && candidate.toolCallId === message.toolCallId);
+			if (rule && Array.isArray(message.content)) {
+				const replacement = [{ type: "text", text: rule.replacement }];
+				if (JSON.stringify(message.content) !== JSON.stringify(replacement)) {
+					next = { ...next, content: replacement };
+					changed = true;
+				}
+			}
+		} else {
+			const result = applyBlockRulesToContent(next.content, state.rules);
+			if (result.changed) {
+				next = { ...next, content: result.content };
+				changed = true;
+			}
+		}
+
+		const imageResult = stripRecordedImages(next.content, state.imageSignatures);
+		if (imageResult.changed) {
+			next = { ...next, content: imageResult.content };
+			changed = true;
+		}
+		return next;
+	});
+	return { messages: changed ? nextMessages : messages, changed };
+}
+
+function shake(sessionManager: SessionReader, mode: ShakeMode, state: ShakeState, persist: (data: PersistedShakeState) => void): ShakeResult {
+	const branchEntries = sessionManager.getBranch();
 	if (mode === "images") {
-		const { removed, runtimeRefresh } = await dropImages(sessionManager, commitRewrite);
-		return { mode, toolResultsDropped: 0, blocksDropped: 0, imagesDropped: removed, tokensFreed: 0, runtimeRefresh };
+		const imageSignatures = collectImageSignatures(branchEntries).filter(signature => !state.imageSignatures.has(signature));
+		if (imageSignatures.length === 0) return { mode, toolResultsDropped: 0, blocksDropped: 0, imagesDropped: 0, tokensFreed: 0 };
+		for (const signature of imageSignatures) state.imageSignatures.add(signature);
+		persist({ version: 1, imageSignatures });
+		return { mode, toolResultsDropped: 0, blocksDropped: 0, imagesDropped: imageSignatures.length, tokensFreed: 0 };
 	}
 
-	const branchEntries = sessionManager.getBranch();
 	const regions = collectShakeRegions(branchEntries, { ...AGGRESSIVE_SHAKE_CONFIG, keepBoundaryId: findLatestCompactionBoundary(branchEntries) });
-	if (regions.length === 0) return { mode, toolResultsDropped: 0, blocksDropped: 0, tokensFreed: 0 };
-
-	const artifactId = await saveShakeArtifact(sessionManager, regions);
+	const rules: ContextShakeRule[] = [];
 	let toolResultsDropped = 0;
 	let blocksDropped = 0;
 	let originalTokens = 0;
 	let replacementTokens = 0;
-	const items = regions.map((region, index) => {
-		if (region.kind === "toolResult") toolResultsDropped++;
+	for (const region of regions) {
+		const rule = ruleFromRegion(region);
+		if (!rule || hasRule(state, rule)) continue;
+		rules.push(rule);
+		if (rule.kind === "toolResult") toolResultsDropped++;
 		else blocksDropped++;
 		originalTokens += region.tokens;
-		const replacement = shakePlaceholder(region, index, artifactId);
-		replacementTokens += estimateTokens(replacement);
-		return { region, replacement };
-	});
-
-	applyShakeRegions(items);
-	const runtimeRefresh = await commitRewrite();
-	return { mode, toolResultsDropped, blocksDropped, tokensFreed: Math.max(0, originalTokens - replacementTokens), artifactId, runtimeRefresh };
+		replacementTokens += estimateTokens(rule.replacement);
+	}
+	if (rules.length === 0) return { mode, toolResultsDropped: 0, blocksDropped: 0, tokensFreed: 0 };
+	state.rules.push(...rules);
+	persist({ version: 1, rules });
+	return { mode, toolResultsDropped, blocksDropped, tokensFreed: Math.max(0, originalTokens - replacementTokens) };
 }
 
 export default function piShakeExtension(pi: ExtensionAPI): void {
+	const state = createShakeState();
+
+	pi.on("session_start", async (_event, ctx) => {
+		reconstructShakeState(ctx.sessionManager as unknown as SessionReader, state);
+	});
+
+	pi.on("session_tree", async (_event, ctx) => {
+		reconstructShakeState(ctx.sessionManager as unknown as SessionReader, state);
+	});
+
+	pi.on("context", async (event, _ctx) => {
+		const result = applyContextShake(event.messages as unknown as Message[], state);
+		if (!result.changed) return undefined;
+		return { messages: result.messages as typeof event.messages };
+	});
+
 	pi.registerCommand("shake", {
-		description: "Drop heavy content from context (tool results, large blocks, or images)",
+		description: "Drop heavy content from future model context (tool results, large blocks, or images)",
 		handler: async (args, ctx) => {
 			const mode = parseShakeMode(args ?? "");
 			if (typeof mode !== "string") {
@@ -435,24 +499,8 @@ export default function piShakeExtension(pi: ExtensionAPI): void {
 			}
 
 			await ctx.waitForIdle();
-			const ctxWithFutureApis = ctx as ExtensionCommandContextLike;
-			if (typeof ctxWithFutureApis.shake === "function") {
-				const result = await ctxWithFutureApis.shake(mode);
-				ctx.ui.notify(formatShakeSummary(result), "info");
-				return;
-			}
-
-			const sessionManager = ctx.sessionManager as unknown as MutableSessionManager;
-			if (typeof sessionManager.rewriteEntries !== "function") {
-				ctx.ui.notify("/shake is unavailable: this Pi version does not expose session rewriting to extensions.", "error");
-				return;
-			}
-
-			const result = await shake(sessionManager, mode, () => commitBestEffortRewrite(ctxWithFutureApis, sessionManager));
+			const result = shake(ctx.sessionManager as unknown as SessionReader, mode, state, data => pi.appendEntry(SHAKE_STATE_CUSTOM_TYPE, data));
 			ctx.ui.notify(formatShakeSummary(result), "info");
-			if (didRewriteSession(result) && result.runtimeRefresh === "unavailable") {
-				ctx.ui.notify("Persisted session was shaken; live provider cache may update only after a session reload.", "warning");
-			}
 		},
 	});
 }
